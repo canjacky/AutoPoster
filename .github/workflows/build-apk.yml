@@ -1,0 +1,74 @@
+name: Build & Release AutoPoster v2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - "AutoPoster_v2.zip"
+      - ".github/workflows/build-apk.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Projekt entpacken
+        run: |
+          rm -rf AutoPoster
+          unzip -o AutoPoster_v2.zip
+          test -f AutoPoster/app/build.gradle.kts
+
+      - name: Signierschlüssel vorbereiten
+        env:
+          KEYSTORE_B64: ${{ secrets.AUTPOSTER_KEYSTORE_B64 }}
+        run: |
+          test -n "$KEYSTORE_B64" || (echo "AUTPOSTER_KEYSTORE_B64 fehlt" && exit 1)
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/autoposter-release.jks"
+
+      - name: Signierte Release-APK bauen
+        working-directory: AutoPoster
+        env:
+          AUTPOSTER_KEYSTORE_PATH: ${{ runner.temp }}/autoposter-release.jks
+          AUTPOSTER_STORE_PASSWORD: ${{ secrets.AUTPOSTER_STORE_PASSWORD }}
+          AUTPOSTER_KEY_ALIAS: ${{ secrets.AUTPOSTER_KEY_ALIAS }}
+          AUTPOSTER_KEY_PASSWORD: ${{ secrets.AUTPOSTER_KEY_PASSWORD }}
+        run: |
+          gradle :app:assembleRelease --stacktrace
+          cp app/build/outputs/apk/release/app-release.apk ../AutoPoster.apk
+
+      - name: Version ermitteln
+        id: version
+        run: |
+          VERSION=$(grep -m1 'versionName = ' AutoPoster/app/build.gradle.kts | sed -E 's/.*"([0-9.]+)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: APK als Artifact hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoPoster-${{ steps.version.outputs.version }}-signed
+          path: AutoPoster.apk
+
+      - name: GitHub Release erstellen/aktualisieren
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" AutoPoster.apk --clobber
+          else
+            gh release create "$TAG" AutoPoster.apk --title "AutoPoster $TAG" --notes "Signierte AutoPoster-Version. Installation/Update über Android." --latest
+          fi
