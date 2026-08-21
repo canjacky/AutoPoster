@@ -32,12 +32,54 @@ jobs:
           unzip -o AutoPoster_v2.zip
           test -f AutoPoster/app/build.gradle.kts
 
-      - name: Signierschlüssel vorbereiten
+      - name: Signierschlüssel sicher vorbereiten
         env:
           KEYSTORE_B64: ${{ secrets.AUTPOSTER_KEYSTORE_B64 }}
         run: |
-          test -n "$KEYSTORE_B64" || (echo "AUTPOSTER_KEYSTORE_B64 fehlt" && exit 1)
-          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/autoposter-release.jks"
+          python3 - <<'PY'
+          import os, re, base64, hashlib, sys
+
+          raw = os.environ.get("KEYSTORE_B64", "")
+          if not raw.strip():
+              sys.exit("AUTPOSTER_KEYSTORE_B64 fehlt")
+
+          # Akzeptiert sowohl den reinen Base64-Wert als auch versehentlich
+          # mitkopierte Bezeichner/Zeilenumbrüche aus der Hilfsdatei.
+          candidates = re.findall(r"[A-Za-z0-9+/=]{1000,}", raw.replace("\r", "").replace("\n", ""))
+          if candidates:
+              encoded = max(candidates, key=len)
+          else:
+              encoded = "".join(raw.split())
+              encoded = re.sub(r"^AUTPOSTER_KEYSTORE_B64[:=]?", "", encoded)
+
+          try:
+              data = base64.b64decode(encoded, validate=True)
+          except Exception as exc:
+              sys.exit(f"Keystore-Secret ist kein gültiges Base64: {exc}")
+
+          expected = "a591601ffc288b091c5812fdc4bc0053851316aa7fc1d5c211b5e6361ffda82f"
+          actual = hashlib.sha256(data).hexdigest()
+          if actual != expected:
+              sys.exit("Keystore stimmt nicht mit dem vorgesehenen AutoPoster-v2-Signierschlüssel überein")
+
+          path = os.path.join(os.environ["RUNNER_TEMP"], "autoposter-release.jks")
+          with open(path, "wb") as f:
+              f.write(data)
+          print(f"Keystore OK: {len(data)} Bytes, SHA-256 geprüft")
+          PY
+
+      - name: Signierschlüssel und Alias prüfen
+        env:
+          STORE_PASSWORD: ${{ secrets.AUTPOSTER_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.AUTPOSTER_KEY_ALIAS }}
+        run: |
+          test -n "$STORE_PASSWORD" || (echo "AUTPOSTER_STORE_PASSWORD fehlt" && exit 1)
+          test -n "$KEY_ALIAS" || (echo "AUTPOSTER_KEY_ALIAS fehlt" && exit 1)
+          keytool -list \
+            -keystore "$RUNNER_TEMP/autoposter-release.jks" \
+            -storepass "$STORE_PASSWORD" \
+            -alias "$KEY_ALIAS" >/dev/null
+          echo "Keystore-Passwort und Alias OK"
 
       - name: Signierte Release-APK bauen
         working-directory: AutoPoster
@@ -47,13 +89,20 @@ jobs:
           AUTPOSTER_KEY_ALIAS: ${{ secrets.AUTPOSTER_KEY_ALIAS }}
           AUTPOSTER_KEY_PASSWORD: ${{ secrets.AUTPOSTER_KEY_PASSWORD }}
         run: |
+          test -n "$AUTPOSTER_KEY_PASSWORD" || (echo "AUTPOSTER_KEY_PASSWORD fehlt" && exit 1)
           gradle :app:assembleRelease --stacktrace
           cp app/build/outputs/apk/release/app-release.apk ../AutoPoster.apk
+
+      - name: APK-Signatur prüfen
+        run: |
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)
+          "$APKSIGNER" verify --verbose --print-certs AutoPoster.apk
 
       - name: Version ermitteln
         id: version
         run: |
           VERSION=$(grep -m1 'versionName = ' AutoPoster/app/build.gradle.kts | sed -E 's/.*"([0-9.]+)".*/\1/')
+          test -n "$VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: APK als Artifact hochladen
@@ -61,6 +110,7 @@ jobs:
         with:
           name: AutoPoster-${{ steps.version.outputs.version }}-signed
           path: AutoPoster.apk
+          if-no-files-found: error
 
       - name: GitHub Release erstellen/aktualisieren
         env:
@@ -70,5 +120,8 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" AutoPoster.apk --clobber
           else
-            gh release create "$TAG" AutoPoster.apk --title "AutoPoster $TAG" --notes "Signierte AutoPoster-Version. Installation/Update über Android." --latest
+            gh release create "$TAG" AutoPoster.apk \
+              --title "AutoPoster $TAG" \
+              --notes "Signierte AutoPoster-Version. Installation/Update über Android." \
+              --latest
           fi
