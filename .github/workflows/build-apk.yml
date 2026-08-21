@@ -14,15 +14,19 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+    steps:
+      - name: Repository laden
+        uses: actions/checkout@v4
+
+      - name: Java 17 einrichten
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - uses: gradle/actions/setup-gradle@v4
+      - name: Gradle einrichten
+        uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.10.2"
 
@@ -32,7 +36,7 @@ jobs:
           unzip -o AutoPoster_v2.zip
           test -f AutoPoster/app/build.gradle.kts
 
-      - name: Signierschlüssel sicher vorbereiten
+      - name: Signierschlüssel robust vorbereiten
         env:
           KEYSTORE_B64: ${{ secrets.AUTPOSTER_KEYSTORE_B64 }}
         run: |
@@ -43,28 +47,81 @@ jobs:
           if not raw.strip():
               sys.exit("AUTPOSTER_KEYSTORE_B64 fehlt")
 
-          # Akzeptiert sowohl den reinen Base64-Wert als auch versehentlich
-          # mitkopierte Bezeichner/Zeilenumbrüche aus der Hilfsdatei.
-          candidates = re.findall(r"[A-Za-z0-9+/=]{1000,}", raw.replace("\r", "").replace("\n", ""))
-          if candidates:
-              encoded = max(candidates, key=len)
+          EXPECTED_SHA = "a591601ffc288b091c5812fdc4bc0053851316aa7fc1d5c211b5e6361ffda82f"
+          EXPECTED_BYTES = 3520
+          EXPECTED_B64_LEN = 4696
+          B64CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+
+          def matches(enc: str):
+              try:
+                  if len(enc) % 4:
+                      return None
+                  data = base64.b64decode(enc, validate=True)
+              except Exception:
+                  return None
+              if len(data) != EXPECTED_BYTES:
+                  return None
+              if hashlib.sha256(data).hexdigest() != EXPECTED_SHA:
+                  return None
+              return data
+
+          # 1) Exakten bekannten Bezeichner entfernen und Whitespace beseitigen.
+          cleaned = "".join(raw.replace("AUTPOSTER_KEYSTORE_B64", "").split())
+          cleaned = "".join(ch for ch in cleaned if ch in B64CHARS)
+
+          candidates = [cleaned]
+
+          # 2) Falls vor dem eigentlichen Wert Text mitkopiert wurde: ab dem
+          #    bekannten PKCS12/Base64-Anfang testen.
+          start = cleaned.find("MIINvA")
+          if start >= 0:
+              candidates.append(cleaned[start:])
+
+          # 3) Normale Kandidaten, sowie 4696-Zeichen-Fenster testen.
+          seen = set()
+          for c in list(candidates):
+              if not c or c in seen:
+                  continue
+              seen.add(c)
+
+              data = matches(c)
+              if data is not None:
+                  break
+
+              if len(c) >= EXPECTED_B64_LEN:
+                  for i in range(0, len(c) - EXPECTED_B64_LEN + 1):
+                      data = matches(c[i:i + EXPECTED_B64_LEN])
+                      if data is not None:
+                          break
+                  if data is not None:
+                      break
+
+              # 4) Häufiger Copy/Paste-Fehler: genau EIN zusätzliches gültiges
+              #    Base64-Zeichen wurde eingefügt. Bei 4697 Zeichen probieren
+              #    wir jede mögliche Ein-Zeichen-Entfernung und akzeptieren
+              #    ausschließlich den Kandidaten mit dem festen SHA-256.
+              if len(c) == EXPECTED_B64_LEN + 1:
+                  for i in range(len(c)):
+                      repaired = c[:i] + c[i+1:]
+                      data = matches(repaired)
+                      if data is not None:
+                          print("Keystore-Secret automatisch repariert: 1 zusätzliches Zeichen entfernt")
+                          break
+                  if data is not None:
+                      break
           else:
-              encoded = "".join(raw.split())
-              encoded = re.sub(r"^AUTPOSTER_KEYSTORE_B64[:=]?", "", encoded)
+              data = None
 
-          try:
-              data = base64.b64decode(encoded, validate=True)
-          except Exception as exc:
-              sys.exit(f"Keystore-Secret ist kein gültiges Base64: {exc}")
-
-          expected = "a591601ffc288b091c5812fdc4bc0053851316aa7fc1d5c211b5e6361ffda82f"
-          actual = hashlib.sha256(data).hexdigest()
-          if actual != expected:
-              sys.exit("Keystore stimmt nicht mit dem vorgesehenen AutoPoster-v2-Signierschlüssel überein")
+          if data is None:
+              sys.exit(
+                  "Keystore-Secret konnte nicht eindeutig rekonstruiert werden. "
+                  f"Bereinigte Länge: {len(cleaned)}; erwartet: {EXPECTED_B64_LEN}."
+              )
 
           path = os.path.join(os.environ["RUNNER_TEMP"], "autoposter-release.jks")
           with open(path, "wb") as f:
               f.write(data)
+
           print(f"Keystore OK: {len(data)} Bytes, SHA-256 geprüft")
           PY
 
@@ -96,6 +153,7 @@ jobs:
       - name: APK-Signatur prüfen
         run: |
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)
+          test -n "$APKSIGNER"
           "$APKSIGNER" verify --verbose --print-certs AutoPoster.apk
 
       - name: Version ermitteln
@@ -112,7 +170,7 @@ jobs:
           path: AutoPoster.apk
           if-no-files-found: error
 
-      - name: GitHub Release erstellen/aktualisieren
+      - name: GitHub Release erstellen oder aktualisieren
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: v${{ steps.version.outputs.version }}
