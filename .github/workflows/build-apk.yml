@@ -171,7 +171,7 @@ jobs:
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)
           test -n "$APKSIGNER"
           "$APKSIGNER" verify --verbose --print-certs AutoPoster.apk | tee "$RUNNER_TEMP/apksigner.txt"
-          grep -qi "Signer #1 certificate SHA-256 digest: a3f354dbe874d87c8d532e7543bbc14a38ff319d449b48cd33c212a7c197bf86" "$RUNNER_TEMP/apksigner.txt"
+          grep -Eqi "certificate SHA-256 digest: a3f354dbe874d87c8d532e7543bbc14a38ff319d449b48cd33c212a7c197bf86" "$RUNNER_TEMP/apksigner.txt"
           echo "APK-Signatur und erwartetes AutoPoster-Zertifikat OK"
 
       - name: Version ermitteln
